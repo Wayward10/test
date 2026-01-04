@@ -1,0 +1,313 @@
+#!/bin/bash
+
+# ==================== 配置区域 ====================
+
+# Lerobot 路径（容器内根目录）
+LEROBOT_ROOT="/lerobot"
+TRAIN_SCRIPT="${LEROBOT_ROOT}/src/lerobot/scripts/train.py"
+
+# 设置 PYTHONPATH 以确保可以导入 lerobot 模块
+export PYTHONPATH="${LEROBOT_ROOT}/src:${PYTHONPATH}"
+
+# 设置 PyTorch CUDA 内存分配配置（解决内存碎片问题）
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# ==================== GPU 内存清理和检查 ====================
+echo "检查 GPU 状态..."
+# 检查 GPU 使用情况（如果 nvidia-smi 可用）
+if command -v nvidia-smi &> /dev/null; then
+    nvidia-smi --query-gpu=index,name,memory.used,memory.total --format=csv,noheader,nounits | while IFS=',' read -r idx name used total; do
+        echo "GPU $idx ($name): ${used}MB / ${total}MB 已使用"
+    done
+fi
+
+# 清理 GPU 缓存和 Python 对象
+echo "清理 GPU 缓存..."
+python3 << 'EOF'
+import torch
+import gc
+import sys
+
+if torch.cuda.is_available():
+    # 清理所有 GPU 缓存
+    torch.cuda.empty_cache()
+    # 强制垃圾回收
+    gc.collect()
+    # 再次清理缓存
+    torch.cuda.empty_cache()
+    
+    # 显示清理后的 GPU 内存状态
+    for i in range(torch.cuda.device_count()):
+        allocated = torch.cuda.memory_allocated(i) / 1024**3
+        reserved = torch.cuda.memory_reserved(i) / 1024**3
+        total = torch.cuda.get_device_properties(i).total_memory / 1024**3
+        print(f"GPU {i}: {allocated:.2f}GB 已分配, {reserved:.2f}GB 已保留, {total:.2f}GB 总计")
+    
+    # 如果仍有大量内存被占用，给出警告
+    if torch.cuda.memory_allocated(0) > 1024**3:  # 如果超过 1GB
+        print("警告: GPU 内存仍被占用，可能有其他进程在使用 GPU")
+        print("建议: 检查并结束其他占用 GPU 的进程，或重启容器")
+else:
+    print("CUDA 不可用")
+    sys.exit(1)
+EOF
+
+echo "GPU 清理完成"
+echo ""
+
+# 切换到 lerobot 根目录
+cd "${LEROBOT_ROOT}"
+
+# 检查训练脚本是否存在
+if [ ! -f "${TRAIN_SCRIPT}" ]; then
+    echo "错误: 找不到训练脚本 ${TRAIN_SCRIPT}"
+    echo "请确认 lerobot 源码在容器内的 /lerobot 目录下"
+    exit 1
+fi
+
+
+# ==================== 策略类型配置 ====================
+# 修改这里选择策略类型: "act", "diffusion", "pi0"
+export POLICY_TYPE="act"
+
+# ==================== 数据集配置 ====================
+# 修改这里设置你的数据集
+DATASET_ROOT="/workspace/dataset"
+DATASET_REPO_ID="franka"  # 修改为你的数据集名称
+OUTPUT_DIR="/workspace/outputs/${POLICY_TYPE}_train/${DATASET_REPO_ID}"
+JOB_NAME="${DATASET_REPO_ID}"
+
+# ==================== PI0 配置 ====================
+# PI0 策略使用在线下载模式，从 Hugging Face Hub 下载模型
+
+# ==================== 根据策略类型设置超参数 ====================
+case "$POLICY_TYPE" in
+    "act")
+        policy="act"
+        BATCH_SIZE=12
+        STEPS=100000
+        SAVE_FREQ=20000
+        LOG_FREQ=200
+        N_OBS_STEPS=1
+        CHUNK_SIZE=100
+        # N_ACTION_STEPS=100
+        # EXTRA_ARGS="--policy.use_amp=true"
+        N_ACTION_STEPS=1  # 使用时间集成时必须为 1
+        EXTRA_ARGS="--policy.use_amp=true --policy.temporal_ensemble_coeff=0.01"
+        NUM_WORKERS=8          # 加速数据加载
+        ;;
+    "diffusion")
+        policy="dp"
+        BATCH_SIZE=1  # 最小批次大小以避免 OOM
+        STEPS=1000000
+        SAVE_FREQ=10000
+        LOG_FREQ=100
+        N_OBS_STEPS=2
+        HORIZON=64  # 减小 horizon 以节省内存（从 128 减小到 64）
+        N_ACTION_STEPS=32  # 相应调整 action steps
+        DROP_N_LAST_FRAMES=$((HORIZON - N_ACTION_STEPS - N_OBS_STEPS + 1))
+        # 减小模型大小以节省内存
+        EXTRA_ARGS="--policy.horizon=${HORIZON} --policy.crop_shape=[480,640] --policy.drop_n_last_frames=${DROP_N_LAST_FRAMES} --policy.use_amp=true --policy.down_dims=[256,512,1024]"
+        ;;
+    "pi0")
+        policy="pi0"
+        BATCH_SIZE=1  # 最小批次大小（已经是 1，无法再减小）
+        STEPS=10000
+        SAVE_FREQ=10000
+        LOG_FREQ=2000
+        N_OBS_STEPS=1
+        CHUNK_SIZE=4  # 最小 chunk_size 以节省内存（从 8 减小到 4）
+        N_ACTION_STEPS=4  # 最小 action steps（从 8 减小到 4）
+        # 微调：使用预训练的 PI0 基础模型
+        PRETRAINED_PATH="lerobot/pi0_base"  # 可选: lerobot/pi0_libero
+        # 注意：use_amp 和 gradient_checkpointing 已经在后面添加了
+        EXTRA_ARGS=""
+        
+        # 使用在线下载模式，从 Hugging Face Hub 下载模型
+        echo "使用在线下载模式（从 Hugging Face Hub 下载模型）"
+        export HF_ENDPOINT=https://huggingface.co
+        export TRANSFORMERS_OFFLINE=0
+        export HF_DATASETS_OFFLINE=0
+        export HF_HUB_OFFLINE=0
+        
+        # 尝试登录 Hugging Face（如果需要）
+        echo "检查 Hugging Face 登录状态..."
+        # 优先使用新的 hf 命令，如果没有则使用旧的 huggingface-cli
+        if command -v hf &> /dev/null; then
+            # 检查是否已登录
+            if hf whoami &> /dev/null; then
+                echo "✓ 已登录 Hugging Face"
+            else
+                echo "未登录，尝试使用令牌登录..."
+                # 使用新的 hf auth login 命令
+                HF_TOKEN="${HF_TOKEN:-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}"
+                if hf auth login --token "${HF_TOKEN}" --add-to-git-credential 2>/dev/null; then
+                    echo "✓ 登录成功"
+                else
+                    echo "⚠ 警告: 自动登录失败，请手动运行:"
+                    echo "  hf auth login --token ${HF_TOKEN}"
+                    echo "  或确保已接受模型许可协议: https://huggingface.co/google/paligemma-3b-pt-224"
+                fi
+            fi
+        elif command -v huggingface-cli &> /dev/null; then
+            # 兼容旧的 huggingface-cli 命令
+            if huggingface-cli whoami &> /dev/null; then
+                echo "✓ 已登录 Hugging Face"
+            else
+                echo "未登录，尝试使用令牌登录..."
+                HF_TOKEN="${HF_TOKEN:-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}"
+                if huggingface-cli login --token "${HF_TOKEN}" --add-to-git-credential 2>/dev/null; then
+                    echo "✓ 登录成功"
+                else
+                    echo "⚠ 警告: 自动登录失败，请手动运行:"
+                    echo "  hf auth login --token YOUR_TOKEN"
+                    echo "  或确保已接受模型许可协议: https://huggingface.co/google/paligemma-3b-pt-224"
+                fi
+            fi
+        else
+            echo "⚠ 警告: 未找到 hf 或 huggingface-cli 命令"
+            echo "  请安装: pip install huggingface_hub"
+        fi
+        ;;
+    *)
+        echo "错误: 未知的策略类型: ${POLICY_TYPE}"
+        echo "可用选项: act, diffusion, pi0"
+        exit 1
+        ;;
+esac
+
+# ==================== 输出配置信息 ====================
+echo "=========================================="
+echo "训练配置"
+echo "=========================================="
+echo "数据集: ${DATASET_ROOT}/${DATASET_REPO_ID}"
+echo "策略类型: ${POLICY_TYPE}"
+echo "输出目录: ${OUTPUT_DIR}"
+echo "作业名称: ${JOB_NAME}"
+echo "批次大小: ${BATCH_SIZE}"
+echo "训练步数: ${STEPS}"
+if [ "${POLICY_TYPE}" = "pi0" ]; then
+    echo "Chunk size: ${CHUNK_SIZE}"
+    echo "Action steps: ${N_ACTION_STEPS}"
+fi
+echo "=========================================="
+echo ""
+
+# ==================== 构建训练命令 ====================
+BASE_ARGS="--dataset.repo_id=${DATASET_REPO_ID} \
+--dataset.root=${DATASET_ROOT} \
+--output_dir=${OUTPUT_DIR} \
+--job_name=${JOB_NAME} \
+--policy.type=${POLICY_TYPE} \
+--policy.device=cuda \
+--policy.push_to_hub=false \
+--num_workers=8 \
+--batch_size=${BATCH_SIZE} \
+--steps=${STEPS} \
+--save_freq=${SAVE_FREQ} \
+--log_freq=${LOG_FREQ} \
+--eval_freq=20000 \
+--policy.n_obs_steps=${N_OBS_STEPS} \
+${CHUNK_SIZE:+--policy.chunk_size=${CHUNK_SIZE}} \
+${N_ACTION_STEPS:+--policy.n_action_steps=${N_ACTION_STEPS}} \
+--seed=42 \
+--wandb.enable=false \
+${EXTRA_ARGS}"
+# --num_workers=2 \
+
+# 根据策略类型添加特定参数
+case "$POLICY_TYPE" in
+    "act")
+        BASE_ARGS="${BASE_ARGS} --policy.use_amp=true"
+        ;;
+    "pi0")
+        BASE_ARGS="${BASE_ARGS} --policy.use_amp=true --policy.gradient_checkpointing=true --policy.dtype=bfloat16"
+        # 如果设置了预训练路径，添加微调参数
+        if [ -n "${PRETRAINED_PATH:-}" ]; then
+            BASE_ARGS="${BASE_ARGS} --policy.pretrained_path=${PRETRAINED_PATH}"
+            echo "使用微调模式，预训练模型: ${PRETRAINED_PATH}"
+        else
+            echo "使用全量训练模式（从头开始训练）"
+        fi
+        ;;
+    "diffusion")
+        # Diffusion 策略不支持 gradient_checkpointing，但支持 use_amp
+        # use_amp 已经在 EXTRA_ARGS 中设置
+        ;;
+esac
+
+# ==================== 执行训练 ====================
+# 检查输出目录是否存在，如果存在则删除（避免 FileExistsError）
+if [ -d "${OUTPUT_DIR}" ]; then
+    echo "警告: 输出目录已存在: ${OUTPUT_DIR}"
+    echo "删除旧目录以继续训练..."
+    rm -rf "${OUTPUT_DIR}"
+    echo "已删除旧目录"
+fi
+
+# 再次清理 GPU 缓存（在训练前）
+echo "训练前最后一次清理 GPU 缓存..."
+python3 -c "import torch; torch.cuda.empty_cache(); import gc; gc.collect(); print('GPU 缓存已清理')" 2>/dev/null || true
+
+# 对于 PI0 策略，给出内存使用提示和配置检查
+if [ "${POLICY_TYPE}" = "pi0" ]; then
+    echo ""
+    echo "=========================================="
+    echo "PI0 策略配置检查"
+    echo "=========================================="
+    
+    echo "使用在线模型下载"
+    # 检查 Hugging Face 登录状态
+    if command -v hf &> /dev/null; then
+        echo "检查 Hugging Face 登录状态..."
+        HF_USER=$(hf whoami 2>/dev/null)
+        if [ -n "${HF_USER}" ]; then
+            echo "✓ 已登录 Hugging Face (用户: ${HF_USER})"
+        else
+            echo "⚠ 警告: 未检测到 Hugging Face 登录"
+            echo "  请运行: hf auth login --token YOUR_TOKEN"
+            echo "  或确保已接受模型许可协议: https://huggingface.co/google/paligemma-3b-pt-224"
+        fi
+    elif command -v huggingface-cli &> /dev/null; then
+        echo "检查 Hugging Face 登录状态..."
+        if huggingface-cli whoami &> /dev/null; then
+            echo "✓ 已登录 Hugging Face"
+        else
+            echo "⚠ 警告: 未检测到 Hugging Face 登录"
+            echo "  请运行: hf auth login --token YOUR_TOKEN"
+            echo "  或确保已接受模型许可协议: https://huggingface.co/google/paligemma-3b-pt-224"
+        fi
+    fi
+    
+    echo ""
+    echo "=========================================="
+    echo "PI0 策略内存警告"
+    echo "=========================================="
+    echo "⚠ PI0 是 4B 参数的大型视觉语言模型，在 16GB GPU 上训练非常困难"
+    echo ""
+    echo "当前内存优化配置："
+    echo "  - BATCH_SIZE=1 (最小)"
+    echo "  - CHUNK_SIZE=${CHUNK_SIZE} (已最小化)"
+    echo "  - N_ACTION_STEPS=${N_ACTION_STEPS} (已最小化)"
+    echo "  - gradient_checkpointing=true"
+    echo "  - use_amp=true + dtype=bfloat16"
+    echo ""
+    echo "如果仍然遇到 CUDA OOM 错误："
+    echo "1. 检查是否有其他进程占用 GPU: nvidia-smi"
+    echo "2. 重启容器以清理所有 GPU 内存: docker restart lerobot"
+    echo "3. 考虑使用 ACT 策略（内存需求更小，适合 16GB GPU）"
+    echo "4. 或使用更大的 GPU（推荐 24GB 或更多用于 PI0）"
+    echo ""
+    echo "注意：CHUNK_SIZE=${CHUNK_SIZE} 已经是最小值，"
+    echo "     进一步减小可能严重影响模型性能"
+    echo "=========================================="
+    echo ""
+fi
+
+echo "开始训练..."
+python "${TRAIN_SCRIPT}" ${BASE_ARGS}
+
+echo ""
+echo "=========================================="
+echo "训练完成！检查点保存在: ${OUTPUT_DIR}"
+echo "=========================================="
